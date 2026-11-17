@@ -14,6 +14,13 @@ import db
 SOURCE_URL = os.environ.get("SOURCE_URL", "http://localhost:8001")
 QC_URL = os.environ.get("QC_URL", "http://localhost:8002")
 
+PRIORITY_LABEL = {"urgent": "加急", "normal": "常规"}
+
+
+def normalize_priority(value) -> str:
+    return "urgent" if str(value).strip().lower() in ("urgent", "加急") else "normal"
+
+
 # httpx 硬超时只是兜底；逻辑超时由 asyncio.wait 实现，超时后旧请求不被取消、继续运行
 HARD_TIMEOUT_S = 30.0
 
@@ -41,11 +48,11 @@ def _rid():
 
 # ---------------- 取数 ----------------
 
-async def call_source(batch_id, sample_id, attempt, req_id, span_id):
+async def call_source(batch_id, sample_id, attempt, req_id, span_id, priority):
     try:
         r = await http().get(f"{SOURCE_URL}/fetch", params={
             "sample_id": sample_id, "request_id": req_id,
-            "batch_id": batch_id, "attempt": attempt})
+            "batch_id": batch_id, "attempt": attempt, "priority": priority})
         end = time.time()
         if r.status_code == 200:
             data = r.json()
@@ -60,10 +67,11 @@ async def call_source(batch_id, sample_id, attempt, req_id, span_id):
         return ("failed", None)
 
 
-async def fetch_with_retry(batch_id, sample_id, cfg):
+async def fetch_with_retry(batch_id, sample_id, cfg, priority):
     """首个有效结果胜出。超时只放弃等待、不取消旧请求：
     尝试次数用完后仍在途的旧请求继续等待收尾(可能反超成为有效尝试)，
-    其余迟到完成的记为 late，结果绝不参与入仓。"""
+    其余迟到完成的记为 late，结果绝不参与入仓。
+    每次超时后的重试都是全新请求，按本批级别重新进源站队列(旧请求继续排队/执行)。"""
     timeout_s = cfg["client_timeout_ms"] / 1000.0
     max_attempts = int(cfg["max_attempts"])
     pending = {}   # task -> {attempt, req_id, span_id}
@@ -85,8 +93,9 @@ async def fetch_with_retry(batch_id, sample_id, cfg):
         attempt += 1
         req_id = _rid()
         span_id = db.insert_span(batch_id, sample_id, "fetch", "client", "orchestrator",
-                                 attempt, req_id, "running", time.time())
-        task = asyncio.create_task(call_source(batch_id, sample_id, attempt, req_id, span_id))
+                                 attempt, req_id, "running", time.time(), priority=priority)
+        task = asyncio.create_task(
+            call_source(batch_id, sample_id, attempt, req_id, span_id, priority))
         pending[task] = {"attempt": attempt, "req_id": req_id, "span_id": span_id}
         done, _ = await asyncio.wait(set(pending), timeout=timeout_s,
                                      return_when=asyncio.FIRST_COMPLETED)
@@ -127,14 +136,15 @@ async def _finalize_late(pending):
 
 # ---------------- 质控(两项并行) ----------------
 
-async def qc_call(batch_id, sample_id, check, payload):
+async def qc_call(batch_id, sample_id, check, payload, priority):
     stage = f"qc_{check}"
     req_id = _rid()
     span_id = db.insert_span(batch_id, sample_id, stage, "client", "orchestrator",
-                             1, req_id, "running", time.time())
+                             1, req_id, "running", time.time(), priority=priority)
     try:
         r = await http().post(f"{QC_URL}/check/{check}",
-                              json={**payload, "request_id": req_id, "batch_id": batch_id})
+                              json={**payload, "request_id": req_id, "batch_id": batch_id,
+                                    "priority": priority})
         end = time.time()
         if r.status_code == 200:
             res = r.json()
@@ -153,8 +163,8 @@ async def qc_call(batch_id, sample_id, check, payload):
 
 # ---------------- 单样品流程 ----------------
 
-async def process_sample(batch_id, sample_id, cfg):
-    data = await fetch_with_retry(batch_id, sample_id, cfg)
+async def process_sample(batch_id, sample_id, cfg, priority):
+    data = await fetch_with_retry(batch_id, sample_id, cfg, priority)
     if data is None:
         return False
     req_id_used = data.pop("_req_id")
@@ -163,12 +173,12 @@ async def process_sample(batch_id, sample_id, cfg):
                "concentration": data.get("concentration")}
     # 两项质控并行：墙钟取较慢者，不相加
     ok1, ok2 = await asyncio.gather(
-        qc_call(batch_id, sample_id, "nonneg", payload),
-        qc_call(batch_id, sample_id, "match", payload))
+        qc_call(batch_id, sample_id, "nonneg", payload, priority),
+        qc_call(batch_id, sample_id, "match", payload, priority))
     if not (ok1 and ok2):
         return False
     span_id = db.insert_span(batch_id, sample_id, "warehouse", "client", "orchestrator",
-                             1, _rid(), "running", time.time())
+                             1, _rid(), "running", time.time(), priority=priority)
     inserted = db.warehouse_insert(batch_id, sample_id, data.get("concentration"), req_id_used)
     db.finish_span(span_id, time.time(), "ok",
                    {"inserted": inserted, "concentration": data.get("concentration"),
@@ -177,10 +187,11 @@ async def process_sample(batch_id, sample_id, cfg):
     return True
 
 
-async def run_batch(batch_id, sample_ids):
+async def run_batch(batch_id, sample_ids, priority="normal"):
+    priority = normalize_priority(priority)
     cfg = db.get_config()  # 批次开始时快照配置，批内一致
     try:
-        await asyncio.gather(*(process_sample(batch_id, s, cfg) for s in sample_ids),
+        await asyncio.gather(*(process_sample(batch_id, s, cfg, priority) for s in sample_ids),
                              return_exceptions=True)
     except Exception:
         pass

@@ -10,10 +10,109 @@ STAGE_LABELS = {
     "qc_match": "质控②样品号对应",
     "warehouse": "入仓",
 }
+PRIORITY_LABELS = {"urgent": "加急", "normal": "常规"}
 
 
 def _f(x):
     return round(float(x), 3)
+
+
+def _sort_ts(s):
+    """排序用时间：真正开始执行的时刻；仍在等待的排到最后；老记录退回到达时刻。"""
+    if s.get("exec_start_ts"):
+        return s["exec_start_ts"]
+    if s.get("end_ts") is not None:
+        return s["start_ts"]
+    return 10 ** 18
+
+
+def _order_row(i, s):
+    pr = s.get("priority") or "normal"
+    exec_ts = s.get("exec_start_ts")
+    if exec_ts is None and s.get("end_ts") is not None:
+        exec_ts = s["start_ts"]   # 老记录没有开始执行时刻：用到达时刻近似
+    return {
+        "order": i,
+        "span_id": s["id"],
+        "batch_id": s["batch_id"],
+        "sample_id": s["sample_id"],
+        "attempt": s["attempt"],
+        "priority": pr,
+        "priority_label": PRIORITY_LABELS.get(pr, "常规"),
+        "arrive_seq": s.get("arrive_seq"),
+        "admit_seq": s.get("admit_seq"),
+        "arrive_ts": s["start_ts"],
+        "admit_ts": exec_ts,          # None = 查询时仍在等待
+        "queue_ms": s.get("queue_ms"),
+        "exec_start_ts": exec_ts,
+        "end_ts": s["end_ts"],
+        "status": s["status"],
+        "request_id": s["request_id"],
+        "own_batch": s.get("_own", True),
+    }
+
+
+def _overlap_window(executed):
+    """本批取数在源站占用的排队窗口：最早到达到最后执行结束/开始执行。"""
+    if not executed:
+        return None
+    begin = min(s["start_ts"] for s in executed)   # 服务端跨度开始=到达源站时刻
+    marks = []
+    for s in executed:
+        if s["end_ts"]:
+            marks.append(s["end_ts"])
+        if s.get("exec_start_ts"):
+            marks.append(s["exec_start_ts"])
+    return begin, max(marks) if marks else begin
+
+
+def _overlap_peers(batch_id, window):
+    """与本批排队窗口时间上重叠的其它批次取数请求。
+
+    判断加急是否越过常规必须看同一时间窗内谁在排队：被越过的常客可能属于别的批次。
+    这里以服务端跨度的时间戳为准(跨进程/重启也成立)，序号仅用于展示。
+    """
+    if not window:
+        return []
+    begin, end = window
+    rows = db.query(
+        "SELECT * FROM spans WHERE side='server' AND stage='fetch' AND batch_id<>?"
+        " AND start_ts<=? AND (end_ts IS NULL OR end_ts>=?)",
+        (batch_id, end, begin))
+    out = []
+    for r in rows:
+        r = dict(r)
+        r["_own"] = False
+        out.append(r)
+    return out
+
+
+def _overtakes(combined, own_span_ids):
+    """加急越过已排队常规：加急晚于某常规到达，却早于该常规开始执行。
+
+    以真实时间戳判定(不依赖放行序号，避免源站进程重启后序号重置造成误判)；
+    仍在等待的常规(admit_ts 为空)同样算被越过。
+    """
+    tol = 0.002
+    normals = [e for e in combined if e["priority"] == "normal"]
+    out = []
+    for e in combined:
+        if e["priority"] != "urgent" or e["admit_ts"] is None:
+            continue
+        beaten = [n for n in normals
+                  if n["arrive_ts"] < e["arrive_ts"] - tol
+                  and (n["admit_ts"] is None or n["admit_ts"] > e["admit_ts"] + tol)]
+        if beaten:
+            out.append({
+                "urgent_sample": e["sample_id"], "urgent_batch_id": e["batch_id"],
+                "urgent_admit_seq": e["admit_seq"], "admit_ts": e["admit_ts"],
+                "overtook": [n["sample_id"] for n in beaten[:5]],
+                "overtook_count": len(beaten),
+                "involves_this_batch": e["span_id"] in own_span_ids
+                                      or any(n["span_id"] in own_span_ids for n in beaten),
+            })
+    out.sort(key=lambda o: (not o["involves_this_batch"], o["admit_ts"]))
+    return out
 
 
 def _err_of(span):
@@ -48,6 +147,22 @@ def analyze(batch_id):
     t1 = max(ends) if ends else t0
     wh_by_sample = {w["sample_id"]: w for w in wh}
     done = bool(sample_ids) and all(s in wh_by_sample for s in sample_ids)
+    priority = batch.get("priority") or "normal"
+
+    # 源站实际执行顺序：服务端跨度按真实开始执行时刻排列(仍在等待的排最后)
+    executed = sorted(
+        [s for s in spans if s["side"] == "server" and s["stage"] == "fetch"],
+        key=lambda s: (_sort_ts(s), s["start_ts"]))
+    exec_order = [_order_row(i, s) for i, s in enumerate(executed, 1)]
+
+    # 同期源站放行顺序：把与本批排队窗口重叠的其它批次请求也纳入，才能如实判断
+    # "加急是否越过已排队的常规"(越过方与本批之外的常规请求竞争同一名额)
+    window = _overlap_window(executed)
+    peers = _overlap_peers(batch_id, window)
+    combined = sorted(executed + peers, key=lambda s: (_sort_ts(s), s["start_ts"]))
+    peer_order = [_order_row(i, s) for i, s in enumerate(combined, 1)]
+    # 是否出现加急越过常规：以真实到达/开始执行时间判定(被越过者可能属其它批次)
+    overtakes = _overtakes(peer_order, {s["id"] for s in spans})
 
     # 各阶段统计：sum(各次耗时求和) 与 wall(墙钟跨度) 分开，并行/重叠不相加
     per_stage = {}
@@ -90,12 +205,31 @@ def analyze(batch_id):
         "samples_stored": len(wh_by_sample),
         "warehouse_rows": len(wh),
         "client_calls": len(client),
+        "priority": priority,
+        "priority_label": PRIORITY_LABELS.get(priority, "常规"),
+        "exec_order": exec_order,
+        "peer_order": peer_order,
+        "overtakes": overtakes,
         "per_stage": per_stage,
         "work_parts_s": {k: _f(v) for k, v in parts.items()},
         "bottleneck": bottleneck,
         "chain": None,
         "blocking": None,
     }
+    if exec_order:
+        own_ov = [o for o in overtakes if o["involves_this_batch"]]
+        waiting_now = [e for e in exec_order if e["exec_start_ts"] is None
+                       and e["end_ts"] is None]
+        result["text_prefix"] = (
+            f"源站实际执行顺序:" +
+            " → ".join(f"#{e['order']}{e['priority_label']}·{e['sample_id']}"
+                       f"(尝试{e['attempt']},等{e['queue_ms'] or 0:.0f}ms)"
+                       for e in exec_order[:12]) +
+            ("…" if len(exec_order) > 12 else "") +
+            (f";仍有 {len(waiting_now)} 个请求在源站排队" if waiting_now else "") +
+            (f";本批相关加急越过排队常规 {len(own_ov)} 次"
+             f"(同期源站共记录 {len(overtakes)} 次)"
+             if overtakes else ";未发生加急越过常规") + "。")
 
     if done:
         # 关键链：最后完成入仓的样品决定了批次完成时间
@@ -141,10 +275,12 @@ def analyze(batch_id):
             bits.append(f"{seg['label']} {d:.3f}s" + (f"({seg['note']})" if seg.get("note") else ""))
         fr = per_stage.get("fetch", {})
         result["text"] = (
-            f"批次#{batch_id} 已完成:{len(wh_by_sample)}/{len(sample_ids)} 样品入仓"
+            f"批次#{batch_id}({PRIORITY_LABELS.get(priority, '常规')}) 已完成:"
+            f"{len(wh_by_sample)}/{len(sample_ids)} 样品入仓"
             f"(入仓记录 {len(wh)} 条、跨服务调用 {len(client)} 次,结论以实际记录为据)。"
             f"墙钟总耗时 {_f(t1 - t0)}s。"
-            f"决定完成时间的关键链(样品 {sid}): " + " → ".join(bits) + "。"
+            + (result.get("text_prefix") or "")
+            + f"决定完成时间的关键链(样品 {sid}): " + " → ".join(bits) + "。"
             f"瓶颈判定: {bottleneck}(各环节工作量秒: "
             + "、".join(f"{k}={v}" for k, v in result["work_parts_s"].items())
             + ";并行质控与重叠重试按墙钟计,不直接相加)。"
@@ -184,6 +320,9 @@ def analyze(batch_id):
         bl = "；".join(f"样品 {b['sample_id']} 阻断于{STAGE_LABELS.get(b['stage'], b['stage'])}"
                        f"({b['detail']})" for b in blocking) or "无阻断明细"
         result["text"] = (
-            f"批次#{batch_id} 未完成:{len(wh_by_sample)}/{len(sample_ids)} 样品入仓"
-            f"(入仓记录 {len(wh)} 条)。阻断环节: {bl}。失败批次不生成成功链。")
+            f"批次#{batch_id}({PRIORITY_LABELS.get(priority, '常规')}) 未完成:"
+            f"{len(wh_by_sample)}/{len(sample_ids)} 样品入仓"
+            f"(入仓记录 {len(wh)} 条)。"
+            + (result.get("text_prefix") or "")
+            + f"阻断环节: {bl}。失败批次不生成成功链。")
     return result

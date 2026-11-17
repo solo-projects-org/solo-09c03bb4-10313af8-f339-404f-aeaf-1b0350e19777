@@ -57,6 +57,10 @@
   .hint { background: #fff8e6; border: 1px solid #f0d58c; border-radius: 6px;
           padding: 6px 10px; font-size: 12px; margin-top: 8px; }
   #pushResult { font-size: 12px; margin-left: 10px; }
+  select { padding: 3px 6px; border: 1px solid var(--bd); border-radius: 6px; }
+  .pill.p-normal { background:#57606a; } .pill.p-urgent { background:#c62828; }
+  .q-ready { color:#2e7d32; } .q-wait { color:#b26a00; }
+  #queueBox table { margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -92,17 +96,29 @@ S1003
 S1004
 S1005
 S1006</textarea>
-  <div style="margin-top:8px">
+  <div style="margin-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <label><span>批次级别</span>
+      <select id="batchPriority">
+        <option value="normal">常规</option>
+        <option value="urgent">加急</option>
+      </select></label>
     <button onclick="submitBatch()">提交批次</button>
-    <span class="muted" style="font-size:12px;margin-left:8px">
+    <span class="muted" style="font-size:12px">
       演示钩子:样品号含 NEG → 负浓度(质控①不通过);含 MIX → 返回错位样品号(质控②不通过)</span>
   </div>
+  <div class="hint">加急批次在源站名额释放时可越过已排队的常规请求;同级按进队先后放行;
+    连续放行两次加急后若有常规等待,下一名额留给最早的常规请求。已开始执行的名额不中断。</div>
+</section>
+
+<section>
+  <h2>源站名额实时队列(等待中按进队顺序;执行中按放行顺序)</h2>
+  <div id="queueBox"><span class="muted">读取中…</span></div>
 </section>
 
 <section>
   <h2>③ 批次列表(自动刷新;多批交错运行,记录互不串)</h2>
   <table id="batchTable">
-    <thead><tr><th>批次</th><th>状态</th><th>样品数</th><th>入仓</th><th>墙钟 s</th>
+    <thead><tr><th>批次</th><th>级别</th><th>状态</th><th>样品数</th><th>入仓</th><th>墙钟 s</th>
       <th>瓶颈判定</th><th>提交时间</th><th>操作</th></tr></thead>
     <tbody></tbody>
   </table>
@@ -112,6 +128,7 @@ S1006</textarea>
   <h2 id="detailTitle">批次详情</h2>
   <div id="conclBox"></div>
   <div id="chainBox" style="margin-top:10px"></div>
+  <div id="execBox" style="margin-top:10px"></div>
   <div id="stageBox" style="margin-top:10px"></div>
   <h2 style="margin-top:14px">跨服务时间线(条块=一次真实调用;黄框=关键链)</h2>
   <div class="legend">
@@ -157,16 +174,19 @@ async function saveConfig(){
 async function submitBatch(){
   const ids = document.getElementById('sampleIds').value.split(/[\s,，;；]+/).filter(Boolean);
   if(!ids.length){ alert('请填写样品号'); return; }
+  const priority = document.getElementById('batchPriority').value;
   const r = await (await fetch('/api/batches',{method:'POST',
-    headers:{'Content-Type':'application/json'}, body:JSON.stringify({sample_ids:ids})})).json();
-  if(r.id){ openBatch(r.id); refreshBatches(); } else alert(r.error||'提交失败');
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sample_ids:ids, priority})})).json();
+  if(r.id){ openBatch(r.id); refreshBatches(); refreshQueue(); } else alert(r.error||'提交失败');
 }
 
 async function refreshBatches(){
   const rows = await (await fetch('/api/batches')).json();
   const tb = document.querySelector('#batchTable tbody');
   tb.innerHTML = rows.map(b=>`<tr class="clickable" onclick="openBatch(${b.id})">
-    <td>#${b.id}</td><td><span class="pill st-${b.status}">${b.status}</span></td>
+    <td>#${b.id}</td><td><span class="pill p-${b.priority}">${b.priority_label}</span></td>
+    <td><span class="pill st-${b.status}">${b.status}</span></td>
     <td>${b.samples}</td><td>${b.stored??'-'}</td><td>${b.wall_s??'-'}</td>
     <td>${b.bottleneck??'-'}</td><td class="mono">${fmtTs(b.created_at)}</td>
     <td><button class="ghost" onclick="event.stopPropagation();openBatch(${b.id})">详情</button></td>
@@ -177,15 +197,70 @@ async function refreshBatches(){
   }
 }
 
+async function refreshQueue(){
+  const el = document.getElementById('queueBox');
+  let q;
+  try { q = await (await fetch('/api/queue')).json(); }
+  catch(e){ el.innerHTML = '<span class="muted">源站不可达</span>'; return; }
+  if(q.error){ el.innerHTML = `<span class="muted">${q.error}</span>`; return; }
+  const wait = (q.waiting||[]).map((w,i)=>`<tr>
+    <td>${i+1}</td><td class="mono">${w.sample_id}</td>
+    <td><span class="pill p-${w.priority}">${w.priority_label}</span></td>
+    <td>批#${w.batch_id}</td><td>尝试${w.attempt}</td>
+    <td class="q-wait">等 ${w.wait_ms.toFixed(0)}ms</td></tr>`).join('');
+  const exe = (q.executing||[]).map(e=>`<tr>
+    <td class="q-ready">#${e.admit_seq}</td><td class="mono">${e.sample_id}</td>
+    <td><span class="pill p-${e.priority}">${e.priority_label}</span></td>
+    <td>批#${e.batch_id}</td><td>尝试${e.attempt}</td>
+    <td>已执行 ${e.running_ms.toFixed(0)}ms(等名额 ${e.wait_ms.toFixed(0)}ms)</td></tr>`).join('');
+  el.innerHTML =
+    `<div class="muted" style="font-size:12px;margin-bottom:6px">名额 ${q.running}/${q.slots} 占用;
+      连续加急放行 ${q.urgent_streak};${q.policy}</div>
+     <b>执行中(按放行顺序):</b>
+     <table><thead><tr><th>放行序</th><th>样品</th><th>级别</th><th>批次</th><th>尝试</th><th>实际</th></tr></thead>
+     <tbody>${exe||'<tr><td colspan="6" class="muted">空闲</td></tr>'}</tbody></table>
+     <b style="display:inline-block;margin-top:8px">等待中(按进队顺序):</b>
+     <table><thead><tr><th>队列位</th><th>样品</th><th>级别</th><th>批次</th><th>尝试</th><th>已等待</th></tr></thead>
+     <tbody>${wait||'<tr><td colspan="6" class="muted">无排队请求</td></tr>'}</tbody></table>`;
+}
+
 async function openBatch(id){ currentBatch=id; await loadDetail(id); }
 async function loadDetail(id){
   const d = await (await fetch('/api/batches/'+id)).json();
   currentDetail = d;
   document.getElementById('detail').hidden = false;
-  document.getElementById('detailTitle').textContent =
-    `批次 #${id} 详情(状态 ${d.batch.status},样品 ${d.batch.sample_ids.length} 个)`;
-  renderConclusion(d); renderChain(d); renderStages(d); renderWaterfall(d);
-  renderSpans(d); renderWarehouse(d);
+  document.getElementById('detailTitle').innerHTML =
+    `批次 #${id} 详情(状态 ${d.batch.status},级别
+     <span class="pill p-${d.batch.priority}">${d.batch.priority_label}</span>
+     ,样品 ${d.batch.sample_ids.length} 个)`;
+  renderConclusion(d); renderChain(d); renderExecOrder(d); renderStages(d);
+  renderWaterfall(d); renderSpans(d); renderWarehouse(d);
+}
+
+function renderExecOrder(d){
+  const c = d.conclusion;
+  const el = document.getElementById('execBox');
+  if(!c || !c.exec_order || !c.exec_order.length){ el.innerHTML=''; return; }
+  const order = (c.peer_order && c.peer_order.length ? c.peer_order : c.exec_order);
+  const rows = order.map(e=>`<tr ${e.own_batch===false?'class="muted"':''}>
+    <td>#${e.order}</td><td>#${e.batch_id}${e.own_batch===false?'(同期)':''}</td>
+    <td class="mono">${e.sample_id}</td>
+    <td><span class="pill p-${e.priority}">${e.priority_label}</span></td>
+    <td>${e.attempt}</td><td class="mono">${e.arrive_seq??''}</td><td class="mono">${e.admit_seq??''}</td>
+    <td>${e.queue_ms!=null?e.queue_ms.toFixed(0)+'ms':''}</td>
+    <td class="mono">${e.exec_start_ts?fmtTs(e.exec_start_ts):''}</td>
+    <td class="mono">${e.end_ts?fmtTs(e.end_ts):'执行中'}</td>
+    <td><span class="pill sp-${e.status}">${e.status}</span></td></tr>`).join('');
+  const ov = (c.overtakes||[]).length
+    ? `<div class="hint">同期源站加急越过排队常规 ${c.overtakes.length} 次:` +
+      c.overtakes.map(o=>`加急 ${o.urgent_sample}(批#${o.urgent_batch_id},放行序 ${o.urgent_admit_seq}) 越过 ${o.overtook.join('、')}${o.overtook_count>o.overtook.length?' 等':''}`).join(';') +
+      '。判定按源站同进程的到达序/放行序,含其他批次的常规请求。</div>'
+    : `<div class="hint">同期源站记录中未出现加急越过已排队常规。</div>`;
+  el.innerHTML =
+    `<b>源站放行/执行顺序(按 admit_seq;灰行=同期其他批次;到达序 arrive_seq 越小越早进队):</b>
+     <table><thead><tr><th>执行序</th><th>批次</th><th>样品</th><th>级别</th><th>尝试</th><th>到达序</th>
+     <th>放行序</th><th>等名额</th><th>开始执行</th><th>执行结束</th><th>状态</th></tr></thead>
+     <tbody>${rows}</tbody></table>${ov}`;
 }
 
 function renderConclusion(d){
@@ -214,11 +289,15 @@ function renderChain(d){
     return `<tr><td class="${s.kind==='wait'?'chain-wait':'chain-exec'}">${s.kind==='wait'?'等待':'执行'}</td>
       <td>${s.label}</td><td>${dur} s</td><td class="muted">${s.note||''}</td></tr>`;
   }).join('');
+  const wh = d.warehouse.find(w=>w.sample_id===c.chain.sample_id);
   document.getElementById('chainBox').innerHTML =
     `<b>决定完成时间的等待与执行链(样品 ${c.chain.sample_id},合计 ${c.chain.total_s}s;`+
     `批次墙钟 ${c.wall_s}s):</b>
      <table><thead><tr><th>类型</th><th>环节</th><th>耗时</th><th>说明</th></tr></thead>
-     <tbody>${rows}</tbody></table>`;
+     <tbody>${rows}</tbody></table>
+     <div class="hint">批次完成结果:${c.status==='done'?'全部样品入仓':'存在未入仓样品'};
+      入仓 ${c.samples_stored}/${c.samples_total} 条记录;
+      ${wh?`关键样品入仓时间 ${fmtTs(wh.stored_at)}(记录#${wh.id})`:'关键样品无入仓记录'}。</div>`;
 }
 
 function renderStages(d){
@@ -253,10 +332,13 @@ function renderWaterfall(d){
   for(const s of sorted){
     const l=((s.start_ts-t0)/span*100), w=Math.max(((s.end_ts||s.start_ts)-s.start_ts)/span*100, .4);
     const label = `${s.sample_id} · ${STAGE_LABEL[s.stage]||s.stage}`+
-      (s.stage==='fetch'?` #${s.attempt}`:'')+(s.side==='server'?` ↳${s.service}服务端`:'');
+      (s.stage==='fetch'?` #${s.attempt}${s.priority==='urgent'?'(加急)':''}`:'')+
+      (s.side==='server'?` ↳${s.service}服务端`:'');
     const dur = s.end_ts? ((s.end_ts-s.start_ts)*1000).toFixed(0)+'ms' : '…';
     const tip = `${label}\n状态:${s.status}  耗时:${dur}`+
-      (s.queue_ms?`\n等名额:${s.queue_ms}ms`:'')+(s.note?`\n${s.note}`:'');
+      (s.queue_ms?`\n等名额:${s.queue_ms}ms`:'')+
+      (s.arrive_seq!=null?`\n进队序:${s.arrive_seq} 放行序:${s.admit_seq??'-'}`:'')+
+      (s.note?`\n${s.note}`:'');
     rows += `<div class="wf-row"><div class="wf-label" title="${tip}">${label}</div>
       <div class="wf-track"><div class="wf-bar sp-${s.status} ${s.side==='server'?'server':''} ${crit.has(s.id)?'crit':''}"
         style="left:${l}%;width:${w}%" title="${tip}"></div></div></div>`;
@@ -274,16 +356,19 @@ function renderSpans(d){
   const rows = d.spans.map(s=>`<tr>
     <td>${s.id}</td><td class="mono">${s.sample_id}</td><td>${STAGE_LABEL[s.stage]||s.stage}</td>
     <td>${s.side==='server'?s.service+'服务端':'编排侧'}</td><td>${s.attempt}</td>
+    <td>${s.priority==='urgent'?'加急':'常规'}</td>
     <td><span class="pill sp-${s.status}">${s.status}</span></td>
     <td class="mono">+${((s.start_ts-d.spans[0].start_ts)*1000).toFixed(0)}ms</td>
     <td>${s.end_ts?((s.end_ts-s.start_ts)*1000).toFixed(0)+'ms':'-'}</td>
-    <td>${s.queue_ms??''}</td><td class="mono" title="${s.request_id}">${s.request_id.slice(0,8)}</td>
+    <td>${s.queue_ms??''}</td><td class="mono">${s.arrive_seq??''}→${s.admit_seq??''}</td>
+    <td class="mono" title="${s.request_id}">${s.request_id.slice(0,8)}</td>
     <td class="muted" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
         title="${(s.note||'')}${s.detail?(' '+s.detail):''}">${(s.note||'')}</td></tr>`).join('');
   document.getElementById('spansBox').innerHTML =
-    `<b>调用明细(${d.spans.length} 条,request_id 跨服务关联):</b>
-     <table><thead><tr><th>id</th><th>样品</th><th>阶段</th><th>侧</th><th>尝试</th><th>状态</th>
-     <th>相对开始</th><th>耗时</th><th>等名额ms</th><th>请求</th><th>备注</th></tr></thead>
+    `<b>调用明细(${d.spans.length} 条,request_id 跨服务关联;到达序→放行序仅源站取数有):</b>
+     <table><thead><tr><th>id</th><th>样品</th><th>阶段</th><th>侧</th><th>尝试</th><th>级别</th>
+     <th>状态</th><th>相对开始</th><th>耗时</th><th>等名额ms</th><th>到达→放行</th><th>请求</th>
+     <th>备注</th></tr></thead>
      <tbody>${rows}</tbody></table>`;
 }
 
@@ -301,12 +386,14 @@ async function rerun(){
   if(!currentDetail) return;
   const r = await (await fetch('/api/batches',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sample_ids:currentDetail.batch.sample_ids})})).json();
+    body:JSON.stringify({sample_ids:currentDetail.batch.sample_ids,
+                         priority:currentDetail.batch.priority})})).json();
   if(r.id){ openBatch(r.id); refreshBatches(); }
 }
 
-loadConfig(); refreshBatches();
+loadConfig(); refreshBatches(); refreshQueue();
 setInterval(refreshBatches, 1500);
+setInterval(refreshQueue, 800);
 </script>
 </body>
 </html>

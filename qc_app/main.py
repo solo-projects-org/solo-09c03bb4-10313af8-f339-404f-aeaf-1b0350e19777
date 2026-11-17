@@ -41,6 +41,7 @@ async def check(check: str, body: dict = Body(...)):
         await report({"batch_id": body.get("batch_id", 0), "sample_id": sample_id,
                       "stage": f"qc_{check}", "service": "qc", "attempt": 1,
                       "request_id": body.get("request_id", ""), "status": "failed",
+                      "priority": body.get("priority", "normal"),
                       "start_ts": start, "end_ts": time.time(), "queue_ms": 0,
                       "detail": {"error": f"injected first failure ({check})"}})
         raise HTTPException(500, f"injected first failure ({check})")
@@ -55,6 +56,7 @@ async def check(check: str, body: dict = Body(...)):
     await report({"batch_id": body.get("batch_id", 0), "sample_id": sample_id,
                   "stage": f"qc_{check}", "service": "qc", "attempt": 1,
                   "request_id": body.get("request_id", ""), "status": "ok",
+                  "priority": body.get("priority", "normal"),
                   "start_ts": start, "end_ts": time.time(), "queue_ms": 0,
                   "detail": {**detail, "pass": passed}})
     return {"pass": passed, "check": check, **detail}

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS batches (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   created_at REAL NOT NULL,
   sample_ids TEXT NOT NULL,          -- JSON array
+  priority TEXT NOT NULL DEFAULT 'normal',  -- normal / urgent
   status TEXT NOT NULL DEFAULT 'running',   -- running / done / failed
   finished_at REAL,
   conclusion TEXT                    -- JSON, 完成结论(含关键链/阻断)
@@ -35,11 +36,16 @@ CREATE TABLE IF NOT EXISTS spans (
   start_ts REAL NOT NULL,
   end_ts REAL,
   queue_ms REAL,                     -- 服务端等名额(槽位)耗时
+  priority TEXT NOT NULL DEFAULT 'normal',  -- 该取数请求所属批次的级别
+  arrive_seq INTEGER,                -- 源站受理到达序(进程内全局递增)
+  admit_seq INTEGER,                 -- 源站放行/执行序(进程内全局递增)
+  exec_start_ts REAL,                -- 源站实际开始执行的时刻
   detail TEXT,                       -- JSON
   note TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_spans_batch ON spans(batch_id);
 CREATE INDEX IF NOT EXISTS idx_spans_req ON spans(request_id);
+CREATE INDEX IF NOT EXISTS idx_spans_server ON spans(stage, side, batch_id);
 CREATE TABLE IF NOT EXISTS warehouse (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   batch_id INTEGER NOT NULL,
@@ -55,9 +61,32 @@ CREATE TABLE IF NOT EXISTS kv (
 );
 """
 
+# 旧库兼容：新增列按需补齐(已有数据默认常规级)
+_MIGRATIONS = {
+    "batches": {
+        "priority": "TEXT NOT NULL DEFAULT 'normal'",
+    },
+    "spans": {
+        "priority": "TEXT NOT NULL DEFAULT 'normal'",
+        "arrive_seq": "INTEGER",
+        "admit_seq": "INTEGER",
+        "exec_start_ts": "REAL",
+    },
+}
+
+
+def _migrate():
+    for table, cols in _MIGRATIONS.items():
+        have = {r["name"] for r in _conn.execute(f"PRAGMA table_info({table})")}
+        for col, decl in cols.items():
+            if col not in have:
+                _conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+    _conn.commit()
+
+
 with _lock:
     _conn.executescript(SCHEMA)
-    _conn.commit()
+    _migrate()
 
 
 def execute(sql, args=()):
@@ -80,13 +109,43 @@ def query_one(sql, args=()):
 # ---------- 跨度 ----------
 
 def insert_span(batch_id, sample_id, stage, side, service, attempt, request_id,
-                status, start_ts, queue_ms=None, detail=None):
+                status, start_ts, queue_ms=None, detail=None, priority="normal"):
     cur = execute(
         "INSERT INTO spans(batch_id,sample_id,stage,side,service,attempt,request_id,"
-        "status,start_ts,queue_ms,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "status,start_ts,queue_ms,priority,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (batch_id, sample_id, stage, side, service, attempt, request_id, status,
-         start_ts, queue_ms,
+         start_ts, queue_ms, priority,
          json.dumps(detail, ensure_ascii=False) if detail is not None else None))
+    return cur.lastrowid
+
+
+SERVER_SPAN_FIELDS = ("batch_id", "sample_id", "stage", "service", "attempt", "request_id",
+                      "status", "start_ts", "end_ts", "queue_ms", "priority",
+                      "arrive_seq", "admit_seq", "exec_start_ts", "detail")
+
+
+def upsert_server_span(fields):
+    """服务端跨度按 (side=server, stage, request_id, attempt) 幂等写入。
+
+    源站对同一请求先报"进队"、再报"放行/开始执行"、最后报"完成"，
+    后到的字段覆盖先到的，保证每一次等待与执行都有据可查。
+    """
+    key = (fields.get("stage"), str(fields.get("request_id") or ""), int(fields.get("attempt") or 1))
+    row = query_one(
+        "SELECT id FROM spans WHERE side='server' AND stage=? AND request_id=? AND attempt=?",
+        key)
+    payload = {k: fields.get(k) for k in SERVER_SPAN_FIELDS}
+    if payload.get("detail") is not None and not isinstance(payload["detail"], str):
+        payload["detail"] = json.dumps(payload["detail"], ensure_ascii=False)
+    if row:
+        sets = ", ".join(f"{k}=?" for k in SERVER_SPAN_FIELDS if payload.get(k) is not None)
+        args = [payload[k] for k in SERVER_SPAN_FIELDS if payload.get(k) is not None]
+        execute(f"UPDATE spans SET {sets} WHERE id=?", (*args, row["id"]))
+        return row["id"]
+    cols = [k for k in SERVER_SPAN_FIELDS if payload.get(k) is not None]
+    cur = execute(
+        f"INSERT INTO spans(side,{','.join(cols)}) VALUES('server',{','.join('?' * len(cols))})",
+        [payload[k] for k in cols])
     return cur.lastrowid
 
 

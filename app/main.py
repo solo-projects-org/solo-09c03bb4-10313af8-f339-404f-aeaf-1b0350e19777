@@ -30,12 +30,13 @@ async def create_batch(body: dict = Body(...)):
     ids = list(dict.fromkeys(str(s).strip() for s in raw if str(s).strip()))
     if not ids:
         return JSONResponse({"error": "样品号清单为空"}, status_code=400)
+    priority = pipeline.normalize_priority(body.get("priority"))
     cur = db.execute(
-        "INSERT INTO batches(created_at, sample_ids, status) VALUES(?,?,?)",
-        (time.time(), json.dumps(ids, ensure_ascii=False), "running"))
+        "INSERT INTO batches(created_at, sample_ids, priority, status) VALUES(?,?,?,?)",
+        (time.time(), json.dumps(ids, ensure_ascii=False), priority, "running"))
     bid = cur.lastrowid
-    asyncio.create_task(pipeline.run_batch(bid, ids))
-    return {"id": bid, "samples": len(ids)}
+    asyncio.create_task(pipeline.run_batch(bid, ids, priority))
+    return {"id": bid, "samples": len(ids), "priority": priority}
 
 
 @app.get("/api/batches")
@@ -44,7 +45,9 @@ async def list_batches():
     out = []
     for b in rows:
         item = {"id": b["id"], "status": b["status"], "created_at": b["created_at"],
-                "finished_at": b["finished_at"], "samples": len(json.loads(b["sample_ids"]))}
+                "finished_at": b["finished_at"], "samples": len(json.loads(b["sample_ids"])),
+                "priority": b.get("priority") or "normal",
+                "priority_label": pipeline.PRIORITY_LABEL.get(b.get("priority") or "normal")}
         if b["conclusion"]:
             c = json.loads(b["conclusion"])
             item.update({"bottleneck": c.get("bottleneck"), "wall_s": c.get("wall_s"),
@@ -64,27 +67,48 @@ async def batch_detail(bid: int):
     concl = analysis.analyze(bid) if spans else None
     return {
         "batch": {"id": b["id"], "status": b["status"], "created_at": b["created_at"],
-                  "finished_at": b["finished_at"], "sample_ids": json.loads(b["sample_ids"])},
+                  "finished_at": b["finished_at"], "sample_ids": json.loads(b["sample_ids"]),
+                  "priority": b.get("priority") or "normal",
+                  "priority_label": pipeline.PRIORITY_LABEL.get(b.get("priority") or "normal")},
         "spans": spans,
         "warehouse": wh,
         "conclusion": concl,
     }
 
 
+@app.get("/api/queue")
+async def queue_snapshot():
+    """源站名额队列快照：等待/执行中/最近放行顺序；源站不可达时如实报错。"""
+    try:
+        async with httpx.AsyncClient(timeout=3) as c:
+            r = await c.get(f"{SOURCE_URL}/queue")
+            if r.status_code != 200:
+                return JSONResponse({"error": f"source http {r.status_code}"}, status_code=502)
+            return r.json()
+    except Exception as e:
+        return JSONResponse({"error": f"source unreachable: {e}"}, status_code=502)
+
+
 @app.post("/api/ingest")
 async def ingest(body: dict = Body(...)):
-    """接收源站/质控的服务端跨度(含等名额 queue_ms)，按 request_id 与客户端跨度关联。"""
+    """接收源站/质控的服务端跨度，按 request_id 与客户端跨度关联。
+
+    源站的同一取数请求会上报多次(进队→放行→完成)，按
+    (stage, request_id, attempt) 幂等更新，逐步补全等待/执行/结束证据。
+    """
     try:
-        db.execute(
-            "INSERT INTO spans(batch_id,sample_id,stage,side,service,attempt,request_id,"
-            "status,start_ts,end_ts,queue_ms,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (int(body.get("batch_id", 0)), str(body.get("sample_id", "")),
-             str(body.get("stage", "")), "server", str(body.get("service", "")),
-             int(body.get("attempt", 1)), str(body.get("request_id", "")),
-             str(body.get("status", "ok")), float(body.get("start_ts", 0)),
-             body.get("end_ts"), body.get("queue_ms"),
-             json.dumps(body.get("detail"), ensure_ascii=False)
-             if body.get("detail") is not None else None))
+        fields = {k: body.get(k) for k in db.SERVER_SPAN_FIELDS}
+        if fields.get("priority") is not None:
+            fields["priority"] = pipeline.normalize_priority(fields["priority"])
+        fields["stage"] = str(fields.get("stage") or "")
+        fields["sample_id"] = str(fields.get("sample_id") or "")
+        fields["service"] = str(fields.get("service") or "")
+        fields["request_id"] = str(fields.get("request_id") or "")
+        fields["batch_id"] = int(fields.get("batch_id") or 0)
+        fields["attempt"] = int(fields.get("attempt") or 1)
+        fields["status"] = str(fields.get("status") or "ok")
+        fields["start_ts"] = float(fields.get("start_ts") or 0)
+        db.upsert_server_span(fields)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
     return {"ok": True}
